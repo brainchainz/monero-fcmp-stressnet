@@ -200,7 +200,7 @@ function BlocksTable({ onBlockClick }) {
 
   useEffect(() => {
     let cancelled = false;
-    const fetchBlocks = () => axios.get(`${API}/api/xmr/blocks`, { timeout: 8000 })
+    const fetchBlocks = () => axios.get(`${API}/api/xmr/blocks?limit=100`, { timeout: 8000 })
       .then(r => {
         if (cancelled) return;
         setBlocks(Array.isArray(r.data) ? r.data : []);
@@ -234,7 +234,7 @@ function BlocksTable({ onBlockClick }) {
           </tr>
         </thead>
         <tbody>
-          {blocks.slice(0, 10).map(b => (
+          {blocks.map(b => (
             <tr key={b.height} onClick={() => onBlockClick(String(b.height))}>
               <td style={{ color: 'var(--accent)' }}>{Number(b.height).toLocaleString()}</td>
               <td className="block-hash">{shortHash(b.hash || b.block_hash)}</td>

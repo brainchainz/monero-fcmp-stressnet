@@ -30,3 +30,8 @@ app-data/
 # Archives
 *.zip
 *.tar.gz
+
+# runtime data / scratch
+/db/
+web/Dockerfile.quick
+x-post.txt

@@ -56,8 +56,8 @@ export class BlockHistoryService extends EventEmitter {
     return { height: this.tipHeight, hash: this.tipHash };
   }
 
-  recent(limit: number): XmrBlockSummary[] {
-    return getRecentBlockStats(limit).map(blockSummaryFromRow);
+  recent(limit: number, offset = 0): XmrBlockSummary[] {
+    return getRecentBlockStats(limit, offset).map(blockSummaryFromRow);
   }
 
   since(timestampSeconds: number): XmrBlockSummary[] {

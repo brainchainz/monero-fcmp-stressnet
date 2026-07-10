@@ -23,6 +23,8 @@ const SPAMMER_WALLET_DEFAULT = 'spammer_main';
 
 let spammerWalletState = {
     wallet_open: false,
+    wallet_opening: false,
+    wallet_file_exists: false,
     filename: null,
     address: null,
     balance: 0,
@@ -99,45 +101,70 @@ async function callNodeRestricted(method, params = {}, timeout = 10000) {
 
 async function createSpammerWallet(filename, password = '') {
     const safe = /^[A-Za-z0-9_-]{1,64}$/.test(filename) ? filename : SPAMMER_WALLET_DEFAULT;
-    // Check if wallet already exists on disk to avoid "file_exists" error
-    const walletPath = `${SPAMMER_WALLET_DIR}/${safe}`;
+    spammerWalletState.wallet_opening = true;
     try {
-        if (fs.existsSync(walletPath + '.keys')) {
-            throw new Error(`Wallet file already exists: ${safe}.keys`);
-        }
-    } catch (_) {}
-    await callSpammerWalletRpc('create_wallet', {
-        filename: safe,
-        password,
-        language: 'English'
-    }, 120000);
-    spammerWalletState.filename = safe;
-    spammerWalletState.wallet_open = true;
-    pushSpammerLog('info', `Created spammer wallet: ${safe}`);
-    // Get address
-    const addr = await callSpammerWalletRpc('get_address', { account_index: 0 });
-    spammerWalletState.address = addr.result?.address || null;
-    return { filename: safe, address: spammerWalletState.address };
+        // Check if wallet already exists on disk to avoid "file_exists" error
+        const walletPath = `${SPAMMER_WALLET_DIR}/${safe}`;
+        try {
+            if (fs.existsSync(walletPath + '.keys')) {
+                spammerWalletState.wallet_file_exists = true;
+                throw new Error(`Wallet file already exists: ${safe}.keys`);
+            }
+        } catch (_) {}
+        await callSpammerWalletRpc('create_wallet', {
+            filename: safe,
+            password,
+            language: 'English'
+        }, 120000);
+        spammerWalletState.filename = safe;
+        spammerWalletState.wallet_open = true;
+        spammerWalletState.wallet_file_exists = true;
+        pushSpammerLog('info', `Created spammer wallet: ${safe}`);
+        // Get address
+        const addr = await callSpammerWalletRpc('get_address', { account_index: 0 });
+        spammerWalletState.address = addr.result?.address || null;
+        return { filename: safe, address: spammerWalletState.address };
+    } finally {
+        spammerWalletState.wallet_opening = false;
+    }
 }
 
 async function openSpammerWallet(filename, password = '') {
     const safe = /^[A-Za-z0-9_-]{1,64}$/.test(filename) ? filename : SPAMMER_WALLET_DEFAULT;
-    await callSpammerWalletRpc('open_wallet', {
-        filename: safe,
-        password
-    }, 120000);
-    spammerWalletState.filename = safe;
-    spammerWalletState.wallet_open = true;
-    pushSpammerLog('info', `Opened spammer wallet: ${safe}`);
-    const addr = await callSpammerWalletRpc('get_address', { account_index: 0 });
-    spammerWalletState.address = addr.result?.address || null;
-    return { filename: safe, address: spammerWalletState.address };
+    spammerWalletState.wallet_opening = true;
+    try {
+        await callSpammerWalletRpc('open_wallet', {
+            filename: safe,
+            password
+        }, 120000);
+        spammerWalletState.filename = safe;
+        spammerWalletState.wallet_open = true;
+        spammerWalletState.wallet_file_exists = true;
+        pushSpammerLog('info', `Opened spammer wallet: ${safe}`);
+        const addr = await callSpammerWalletRpc('get_address', { account_index: 0 });
+        spammerWalletState.address = addr.result?.address || null;
+        return { filename: safe, address: spammerWalletState.address };
+    } finally {
+        spammerWalletState.wallet_opening = false;
+    }
 }
 
 async function closeSpammerWallet() {
     await callSpammerWalletRpc('close_wallet', {}, 10000);
     spammerWalletState.wallet_open = false;
+    spammerWalletState.wallet_file_exists = true;  // file still exists on disk
     pushSpammerLog('info', 'Closed spammer wallet');
+}
+
+// Detect whether a spammer wallet file exists on disk (without querying RPC)
+function checkSpammerWalletFileExists(filename = SPAMMER_WALLET_DEFAULT) {
+    const safe = /^[A-Za-z0-9_-]{1,64}$/.test(filename) ? filename : SPAMMER_WALLET_DEFAULT;
+    const walletPath = `${SPAMMER_WALLET_DIR}/${safe}`;
+    try {
+        return fs.existsSync(walletPath + '.keys');
+    } catch (_) {
+        return false;
+    }
 }
 
 async function getSpammerSeed() {
@@ -371,6 +398,7 @@ module.exports = {
     pushSpammerLog,
     callSpammerWalletRpc,
     callNodeRestricted,
+    checkSpammerWalletFileExists,
     createSpammerWallet,
     openSpammerWallet,
     closeSpammerWallet,

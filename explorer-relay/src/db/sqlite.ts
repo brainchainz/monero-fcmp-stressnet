@@ -110,8 +110,8 @@ export const pruneBlockStats = (keepLast: number): void => {
   getDb().prepare('DELETE FROM block_stats WHERE height < ?').run(cutoff);
 };
 
-export const getRecentBlockStats = (limit: number): BlockStatsRow[] =>
-  getDb().prepare('SELECT * FROM block_stats ORDER BY height DESC LIMIT ?').all(limit) as BlockStatsRow[];
+export const getRecentBlockStats = (limit: number, offset = 0): BlockStatsRow[] =>
+  getDb().prepare('SELECT * FROM block_stats ORDER BY height DESC LIMIT ? OFFSET ?').all(limit, offset) as BlockStatsRow[];
 
 export const getBlockStatsRange = (fromHeight: number, toHeight: number): BlockStatsRow[] =>
   getDb()

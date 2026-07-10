@@ -15,7 +15,8 @@ export const blocksRouter = (app: AppState): Router => {
 
   router.get('/', (req, res) => {
     const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 10));
-    res.json(app.blockHistory.recent(limit));
+    const offset = Math.max(0, Number(req.query.offset) || 0);
+    res.json(app.blockHistory.recent(limit, offset));
   });
 
   router.get('/tip', (_req, res) => {
