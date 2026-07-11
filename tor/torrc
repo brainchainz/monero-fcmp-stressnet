@@ -1,2 +1,25 @@
+# Tor config tuned for SuperStress monerod P2P-over-Tor.
+#
+# The stressnet has ~3 live nodes, all on port 28080, which most Tor exits
+# reject. Two defaults make reconnects brutal for this workload:
+#   - SocksTimeout 120: a connect attempt through a bad path can hang a
+#     connection slot for 2 minutes before failing.
+#   - MaxCircuitDirtiness 600: after 10 minutes, new streams get a fresh
+#     circuit through a random exit that probably rejects 28080 again.
+# So: fail fast, and stick to exits that are known to work.
 SocksPort 0.0.0.0:9050
-DataDirectory /tmp/tor
+SocksPolicy accept 10.0.0.0/8
+SocksPolicy accept 172.16.0.0/12
+SocksPolicy accept 192.168.0.0/16
+SocksPolicy reject *
+
+# Fail bad paths in 15s instead of 120s so monerod's retry loop cycles fast.
+SocksTimeout 15
+
+# Keep reusing a working circuit (and its 28080-friendly exit) for 24h
+# instead of rotating every 10 minutes. Slightly weaker unlinkability,
+# acceptable for a public stressnet node whose only secret is its IP.
+MaxCircuitDirtiness 86400
+
+DataDirectory /var/lib/tor
+Log notice stdout
