@@ -2,6 +2,12 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import axios from 'axios';
 import './mining.css';
 
+// Highest network tip observed this session. monerod reports target_height=0
+// (and synchronized=true) whenever it has no peers, so a peerless gap must not
+// be mistaken for "caught up". Kept at module scope so it survives tab
+// remounts. The chain only grows, so this is monotonic by construction.
+let maxObservedTip = 0;
+
 const API = process.env.NODE_ENV === 'development' ? 'http://localhost:8080/api' : '/api';
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -214,11 +220,17 @@ function DashboardTab({ nodeInfo, syncInfo, poolStats }) {
         );
     }
 
-    let syncPct = 100;
-    if (nodeInfo.target_height && nodeInfo.target_height > 0) {
-        syncPct = Math.min(100, Math.floor((nodeInfo.height / nodeInfo.target_height) * 100));
-    }
-    const synced = syncPct >= 99;
+    const height = nodeInfo.height || 0;
+    const reportedTip = Math.max(nodeInfo.target_height || 0, height);
+    if (reportedTip > maxObservedTip) maxObservedTip = reportedTip;
+    const networkTip = maxObservedTip || height;
+    const blocksBehind = Math.max(0, networkTip - height);
+    const peerCount = (nodeInfo.outgoing_connections_count || 0) + (nodeInfo.incoming_connections_count || 0);
+    // Judge "synchronized" on absolute blocks behind, not a percentage: on a
+    // ~3M-block chain, being 23k blocks behind is still ~99% and would wrongly
+    // pass a percent threshold. Require a known tip and being within 2 blocks.
+    const synced = maxObservedTip > 0 && blocksBehind <= 2;
+    const syncPct = networkTip > 0 ? Math.min(100, (height / networkTip) * 100) : 0;
 
     return (
         <div className="dashboard-grid">
@@ -233,9 +245,9 @@ function DashboardTab({ nodeInfo, syncInfo, poolStats }) {
             <div className="glass-panel sync-panel">
                 <div className="sync-header">
                     <span className="mono-sm">
-                        {synced ? '\u25cf SYNCHRONIZED' : '\u25cc SYNCING...'}
+                        {synced ? '\u25cf SYNCHRONIZED' : (peerCount > 0 ? '\u25cc SYNCING...' : '\u25cc SEARCHING FOR PEERS')}
                     </span>
-                    <span className="mono-sm">{syncPct}%</span>
+                    <span className="mono-sm">{synced ? '100%' : `${blocksBehind.toLocaleString()} behind`}</span>
                 </div>
                 <div className="sync-track">
                     <div className="sync-fill" style={{ width: `${syncPct}%` }}>
@@ -243,8 +255,8 @@ function DashboardTab({ nodeInfo, syncInfo, poolStats }) {
                     </div>
                 </div>
                 <div className="sync-footer">
-                    <span>Current: {nodeInfo.height?.toLocaleString()}</span>
-                    <span>Target: {(nodeInfo.target_height || nodeInfo.height)?.toLocaleString()}</span>
+                    <span>Current: {height.toLocaleString()}</span>
+                    <span>Target: {networkTip.toLocaleString()}</span>
                 </div>
             </div>
 
