@@ -16,7 +16,10 @@ const axios = require('axios');
 
 const SPAMMER_WALLET_RPC = process.env.SPAMMER_WALLET_RPC || 'http://monero-fcmp-stressnet-spammer-wallet-rpc-1:28084';
 const MAIN_WALLET_RPC = process.env.WALLET_RPC || 'http://10.88.88.4:28083';
-const MONEROD_RESTRICTED_RPC = process.env.MONEROD_RESTRICTED_RPC || 'http://10.88.88.3:28089';
+// Fall back to the same daemon RPC the rest of the app uses. The old default
+// (10.88.88.3:28089) was a stale address from a previous compose layout, which
+// silently broke every recovery endpoint (flush_txpool, pending_txs, ...).
+const MONEROD_RESTRICTED_RPC = process.env.MONEROD_RESTRICTED_RPC || process.env.MONEROD_RPC || 'http://10.99.10.11:28081';
 
 const SPAMMER_WALLET_DIR = process.env.SPAMMER_WALLET_DIR || '/spammer-wallets';
 const SPAMMER_WALLET_DEFAULT = 'spammer_main';
@@ -29,9 +32,16 @@ let spammerWalletState = {
     address: null,
     balance: 0,
     unlocked_balance: 0,
+    total_balance: 0,          // across all accounts (leaves hold the funds after a tree build)
+    total_unlocked: 0,
+    wallet_height: 0,
+    daemon_height: 0,
+    blocks_behind: null,       // null = unknown, 0 = synced
     num_accounts: 0,
     num_outputs: 0,
     tree_built: false,
+    tree_building: false,
+    tree_progress: null,       // { phase, done, total } while building
     tree_levels: 0,
     tree_leaves: 0,
     spamming: false,
@@ -182,18 +192,33 @@ async function getSpammerRestoreHeight() {
 }
 
 async function refreshSpammerWalletState() {
+    if (!spammerWalletState.wallet_open) return;
     try {
-        const bal = await callSpammerWalletRpc('get_balance', { account_index: 0 }, 15000);
-        spammerWalletState.balance = bal.result?.balance || 0;
-        spammerWalletState.unlocked_balance = bal.result?.unlocked_balance || 0;
+        // get_accounts carries per-account and wallet-wide totals in one call.
+        // (The old code derived num_accounts from total_balance, so a wallet
+        // with zero balance reported zero accounts.)
+        const accts = await callSpammerWalletRpc('get_accounts', {}, 15000);
+        const accounts = accts.result?.subaddress_accounts || [];
+        spammerWalletState.num_accounts = accounts.length;
+        spammerWalletState.balance = accounts[0]?.balance || 0;
+        spammerWalletState.unlocked_balance = accounts[0]?.unlocked_balance || 0;
+        spammerWalletState.total_balance = accts.result?.total_balance || 0;
+        spammerWalletState.total_unlocked = accts.result?.total_unlocked_balance || 0;
     } catch (e) {
         pushSpammerLog('warning', `balance check failed: ${e.message}`);
     }
     try {
-        const accts = await callSpammerWalletRpc('get_accounts', {}, 15000);
-        spammerWalletState.num_accounts = accts.result?.total_balance ? accts.result.subaddress_accounts?.length || 0 : 0;
+        // Wallet vs daemon height: spam txs fail while the wallet is still
+        // scanning, so the UI needs to know when the wallet is actually ready.
+        const wh = await callSpammerWalletRpc('get_height', {}, 15000);
+        spammerWalletState.wallet_height = wh.result?.height || 0;
+        const dh = await callNodeRestricted('get_info', {}, 10000);
+        spammerWalletState.daemon_height = dh.result?.height || 0;
+        spammerWalletState.blocks_behind = spammerWalletState.daemon_height > 0
+            ? Math.max(0, spammerWalletState.daemon_height - spammerWalletState.wallet_height)
+            : null;
     } catch (e) {
-        spammerWalletState.num_accounts = 0;
+        spammerWalletState.blocks_behind = null;
     }
 }
 
@@ -222,142 +247,172 @@ async function fundSpammerWallet(amountAtomic) {
 // Each account gets funded, creating a new output. After confirmations,
 // those outputs can be used for spam.
 
-async function buildOutputTree(nOutputs = 15, nLevels = 3, feePriority = 4) {
+// Amount each leaf account gets. Big enough to sweep for a long time (each
+// sweep only pays a fee), small enough that a default 1 tXMR funding covers a
+// full tree.
+const LEAF_FUND_ATOMIC = 20000000000; // 0.02 tXMR
+const MAX_DESTS_PER_TX = 15;          // protocol allows 16 outputs; keep 1 for change
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function buildOutputTree(nOutputs = 15, nLevels = 3, feePriority = 1) {
     if (!spammerWalletState.wallet_open) {
         throw new Error('Open or create a spammer wallet first');
+    }
+    if (spammerWalletState.tree_building) {
+        throw new Error('A tree build is already running');
     }
     if (nOutputs > 16) throw new Error('nOutputs must be <= 16 (protocol limit)');
     if (nLevels > 5) throw new Error('nLevels capped at 5 for safety');
 
-    pushSpammerLog('info', `Building output tree: ${nOutputs}^${nLevels} = ${Math.pow(nOutputs, nLevels)} potential leaves`);
+    spammerWalletState.tree_building = true;
+    try {
+        const totalAccounts = Math.min(nOutputs * nLevels, 240);
+        pushSpammerLog('info', `Building output tree: ${totalAccounts} leaf accounts`);
 
-    // Get current accounts
-    let accts = await callSpammerWalletRpc('get_accounts', {}, 15000);
-    let existingCount = accts.result?.subaddress_accounts?.length || 0;
-
-    // Level 0: ensure we have at least 1 account
-    if (existingCount === 0) {
-        await callSpammerWalletRpc('create_account', { label: 'spam-root' }, 15000);
+        // Phase 1: create missing accounts
+        let accts = await callSpammerWalletRpc('get_accounts', {}, 15000);
+        let accounts = accts.result?.subaddress_accounts || [];
+        spammerWalletState.tree_progress = { phase: 'creating accounts', done: accounts.length, total: totalAccounts };
+        for (let i = accounts.length; i < totalAccounts; i++) {
+            await callSpammerWalletRpc('create_account', { label: `spam-${i}` }, 10000);
+            spammerWalletState.tree_progress = { phase: 'creating accounts', done: i + 1, total: totalAccounts };
+        }
         accts = await callSpammerWalletRpc('get_accounts', {}, 15000);
-        existingCount = accts.result?.subaddress_accounts?.length || 0;
-    }
+        accounts = accts.result?.subaddress_accounts || [];
 
-    // For simplicity, we create N accounts per level and send from root to each
-    // This creates outputs. We don't do the full tree expansion — instead we
-    // create accounts and fund them in batches. Each funded account = 1 spendable output.
-    const totalAccounts = Math.min(nOutputs * nLevels, 240); // cap at 240 accounts
-    let created = existingCount;
-
-    for (let i = existingCount; i < totalAccounts; i++) {
-        await callSpammerWalletRpc('create_account', { label: `spam-${i}` }, 10000);
-        created++;
-        if (i % 10 === 0) {
-            pushSpammerLog('info', `Created ${created}/${totalAccounts} accounts`);
+        // Phase 2: fund leaves in batches of MAX_DESTS_PER_TX destinations per
+        // tx (one tx funds 15 leaves at once). Funding one-by-one spends the
+        // root's change output before it unlocks, so most sequential transfers
+        // failed with "not enough unlocked money".
+        const toFund = accounts.slice(1).filter(a => (a.balance || 0) < LEAF_FUND_ATOMIC);
+        const totalNeeded = toFund.length * LEAF_FUND_ATOMIC;
+        const rootUnlocked = accounts[0]?.unlocked_balance || 0;
+        if (rootUnlocked < totalNeeded + 100000000000) { // + 0.1 tXMR fee buffer
+            throw new Error(
+                `Need ~${((totalNeeded + 100000000000) / 1e12).toFixed(3)} tXMR unlocked to fund ${toFund.length} leaves, ` +
+                `root has ${(rootUnlocked / 1e12).toFixed(3)} unlocked. Fund the wallet (or wait ~20 min for confirmations).`
+            );
         }
-    }
 
-    // Now fund each account from account 0
-    accts = await callSpammerWalletRpc('get_accounts', {}, 15000);
-    const accounts = accts.result?.subaddress_accounts || [];
-    const rootBal = accounts[0]?.balance || 0;
-    const neededPerAccount = 5000000000; // 0.005 tXMR each (generous for fees)
-    const totalNeeded = (accounts.length - 1) * neededPerAccount;
-
-    if (rootBal < totalNeeded + 1e12) { // +1 tXMR buffer for fees
-        throw new Error(
-            `Need ${(totalNeeded / 1e12).toFixed(4)} tXMR + fees to fund ${accounts.length - 1} accounts. ` +
-            `Root balance: ${(rootBal / 1e12).toFixed(4)} tXMR. Fund the spammer wallet first.`
-        );
-    }
-
-    pushSpammerLog('info', `Funding ${accounts.length - 1} accounts from root...`);
-    let funded = 0;
-    for (let i = 1; i < accounts.length; i++) {
-        try {
-            const acctAddr = await callSpammerWalletRpc('get_address', {
-                account_index: i,
-                address_index: 0
-            }, 10000);
-            const dest = acctAddr.result?.address;
-            if (!dest) continue;
-
-            // Transfer using account_index: 0 (root) to fund account i
-            await callSpammerWalletRpc('transfer', {
-                account_index: 0,
-                destinations: [{ address: dest, amount: neededPerAccount }],
-                priority: feePriority,
-                get_tx_key: true
-            }, 60000);
-            funded++;
-        } catch (e) {
-            pushSpammerLog('warning', `Failed to fund account ${i}: ${e.message}`);
+        let funded = accounts.length - 1 - toFund.length; // already-funded leaves
+        spammerWalletState.tree_progress = { phase: 'funding leaves', done: funded, total: accounts.length - 1 };
+        for (let start = 0; start < toFund.length; start += MAX_DESTS_PER_TX) {
+            const batch = toFund.slice(start, start + MAX_DESTS_PER_TX);
+            const destinations = batch.map(a => ({ address: a.base_address, amount: LEAF_FUND_ATOMIC }));
+            // Change from the previous batch tx is locked for 10 blocks; retry
+            // until it unlocks instead of failing the whole build.
+            for (let attempt = 1; ; attempt++) {
+                try {
+                    await callSpammerWalletRpc('transfer', {
+                        account_index: 0,
+                        destinations,
+                        priority: feePriority,
+                        get_tx_key: true
+                    }, 120000);
+                    break;
+                } catch (e) {
+                    const retryable = /unlocked|not enough money|busy/i.test(e.message);
+                    if (!retryable || attempt >= 12) throw e;
+                    spammerWalletState.tree_progress = {
+                        phase: `waiting for change to unlock (retry ${attempt}/12)`,
+                        done: funded, total: accounts.length - 1
+                    };
+                    pushSpammerLog('info', `Batch ${1 + start / MAX_DESTS_PER_TX}: waiting ~2 min for change to unlock (attempt ${attempt}/12)`);
+                    await sleep(130000);
+                }
+            }
+            funded += batch.length;
+            spammerWalletState.tree_progress = { phase: 'funding leaves', done: funded, total: accounts.length - 1 };
+            pushSpammerLog('info', `Funded ${funded}/${accounts.length - 1} leaves`);
         }
-    }
 
-    spammerWalletState.tree_built = true;
-    spammerWalletState.tree_levels = nLevels;
-    spammerWalletState.tree_leaves = funded;
-    spammerWalletState.num_outputs = funded;
-    pushSpammerLog('info', `Output tree complete: ${funded} funded accounts (leaves)`);
-    return { accounts: accounts.length, funded, totalAccounts };
+        // Persist the wallet so a restart doesn't lose the new accounts/outputs
+        try { await callSpammerWalletRpc('store', {}, 60000); } catch (_) {}
+
+        spammerWalletState.tree_built = true;
+        spammerWalletState.tree_levels = nLevels;
+        spammerWalletState.tree_leaves = funded;
+        spammerWalletState.num_outputs = funded;
+        refreshLeafCache().catch(() => {});
+        pushSpammerLog('info', `Output tree complete: ${funded} funded leaves. Leaf outputs unlock after 10 confirmations (~20 min).`);
+        return { accounts: accounts.length, funded, totalAccounts };
+    } finally {
+        spammerWalletState.tree_building = false;
+        spammerWalletState.tree_progress = null;
+    }
 }
 
 // ── Spam loop ──────────────────────────────────────────────────────────────────
-// Iterates through accounts creating self-spend txs (1-in, 2-out).
+// Round-robin sweep_all over the leaf accounts, matching Rucknium's
+// spam.1in.2out: each sweep spends whatever the leaf holds back to its own
+// address (a self-churn), so there is no fixed amount that can mismatch the
+// leaf balance. (The old loop self-sent a hardcoded 0.1 tXMR from leaves
+// funded with 0.005, so every single spam tx failed with "not enough money".)
 
 let spamInFlight = false;
+let leafCache = [];        // [{ account_index, base_address, label }]
+let leafCursor = 0;
+let sinceStore = 0;
+const STORE_EVERY_TXS = 50; // upstream saves every 2000 at full speed; we tick slower
+
+async function refreshLeafCache() {
+    const accts = await callSpammerWalletRpc('get_accounts', {}, 15000);
+    const accounts = accts.result?.subaddress_accounts || [];
+    leafCache = accounts.slice(1).map(a => ({
+        account_index: a.account_index,
+        base_address: a.base_address,
+        label: a.label
+    }));
+    if (leafCursor >= leafCache.length) leafCursor = 0;
+    return leafCache.length;
+}
 
 async function spamTick() {
     if (!spammerWalletState.spamming || spamInFlight) return;
     spamInFlight = true;
-
     try {
-        const accts = await callSpammerWalletRpc('get_accounts', {}, 15000);
-        const accounts = accts.result?.subaddress_accounts || [];
-        if (accounts.length <= 1) {
-            pushSpammerLog('warning', 'No leaf accounts to spam from — build output tree first');
-            spamInFlight = false;
-            return;
+        if (leafCache.length === 0) {
+            await refreshLeafCache();
+            if (leafCache.length === 0) {
+                pushSpammerLog('warning', 'No leaf accounts to spam from — build the output tree first');
+                return;
+            }
         }
-
-        // Pick a random leaf account (skip index 0, the root)
-        const leafIndex = 1 + Math.floor(Math.random() * (accounts.length - 1));
-        const leafAddr = await callSpammerWalletRpc('get_address', {
-            account_index: leafIndex,
-            address_index: 0
-        }, 10000);
-        const dest = leafAddr.result?.address;
-        if (!dest) {
-            spamInFlight = false;
-            return;
-        }
+        const leaf = leafCache[leafCursor];
+        leafCursor = (leafCursor + 1) % leafCache.length;
 
         spammerWalletState.spam_count++;
         const txStart = Date.now();
+        const result = await callSpammerWalletRpc('sweep_all', {
+            address: leaf.base_address,
+            account_index: leaf.account_index,
+            priority: 1
+        }, 90000);
 
-        // Self-spend: send from leaf back to leaf (creates 1 new output on leaf)
-        // Amount: tiny dust (0.0001 tXMR) to avoid "not enough money"
-        const dust = 100000000000; // 0.0001 tXMR
-        const result = await callSpammerWalletRpc('transfer', {
-            account_index: leafIndex,
-            destinations: [{ address: dest, amount: dust }],
-            priority: 1, // fast
-            get_tx_key: true
-        }, 60000);
+        const hashes = result.result?.tx_hash_list || [];
+        const amounts = result.result?.amount_list || [];
+        const sweptAtomic = amounts.reduce((a, b) => a + b, 0);
+        spammerWalletState.spam_success++;
+        spammerWalletState.last_error = null;
+        pushSpammerLog('info', `Sweep ${spammerWalletState.spam_count} OK: acct ${leaf.account_index} ` +
+            `${(sweptAtomic / 1e12).toFixed(5)} tXMR in ${hashes.length} tx (${Date.now() - txStart}ms)`);
 
-        if (result.error) {
-            spammerWalletState.spam_fail++;
-            spammerWalletState.last_error = result.error.message;
-            pushSpammerLog('warning', `Spam fail: ${result.error.message}`);
-        } else {
-            spammerWalletState.spam_success++;
-            spammerWalletState.last_error = null;
-            pushSpammerLog('info', `Spam tx ${spammerWalletState.spam_count} OK (${Date.now() - txStart}ms) — acct ${leafIndex}`);
+        // Periodically flush the wallet cache to disk so a restart doesn't
+        // rescan from scratch (upstream does this in its spam loop too).
+        if (++sinceStore >= STORE_EVERY_TXS) {
+            sinceStore = 0;
+            try { await callSpammerWalletRpc('store', {}, 60000); pushSpammerLog('info', 'Wallet state saved'); } catch (_) {}
         }
     } catch (e) {
         spammerWalletState.spam_fail++;
         spammerWalletState.last_error = e.message;
-        pushSpammerLog('warning', `Spam error: ${e.message}`);
+        // "No unlocked balance" just means this leaf's churn output hasn't
+        // confirmed yet; it becomes sweepable again after ~10 blocks. Not fatal.
+        if (/unlocked|not enough money/i.test(e.message)) {
+            pushSpammerLog('info', `Acct waiting for confirmations, skipping (${e.message})`);
+        } else {
+            pushSpammerLog('warning', `Spam error: ${e.message}`);
+        }
     } finally {
         spamInFlight = false;
     }
@@ -373,10 +428,11 @@ function startSpamLoop(intervalMs = 5000) {
     spammerWalletState.spam_count = 0;
     spammerWalletState.spam_success = 0;
     spammerWalletState.spam_fail = 0;
+    sinceStore = 0;
     pushSpammerLog('info', `Spam loop started — interval ${intervalMs}ms`);
 
-    // Fire immediately
-    spamTick();
+    // Fresh leaf list, then fire immediately
+    refreshLeafCache().catch(() => {}).then(() => spamTick());
     spammerWalletState.intervalHandle = setInterval(spamTick, intervalMs);
     return { status: 'started', intervalMs };
 }
@@ -388,7 +444,50 @@ function stopSpamLoop() {
     }
     spammerWalletState.spamming = false;
     pushSpammerLog('info', `Spam loop stopped — ${spammerWalletState.spam_success}/${spammerWalletState.spam_count} succeeded`);
+    // Persist the wallet so everything the run created survives a restart
+    callSpammerWalletRpc('store', {}, 60000).catch(() => {});
     return { status: 'stopped', ...spammerWalletState };
+}
+
+// ── Boot-time state recovery ───────────────────────────────────────────────────
+// The web container's in-memory state resets on restart, but the wallet-rpc
+// container usually still has the wallet open (or the wallet file exists on
+// disk). Without this probe, every restart greeted the user with "No spammer
+// wallet found — create one", and Create then failed with "file already
+// exists". Probe the RPC, resume the open wallet, or auto-open the default.
+async function initSpammerState() {
+    try {
+        const addr = await callSpammerWalletRpc('get_address', { account_index: 0 }, 10000);
+        if (addr.result?.address) {
+            spammerWalletState.wallet_open = true;
+            spammerWalletState.wallet_file_exists = true;
+            spammerWalletState.filename = spammerWalletState.filename || SPAMMER_WALLET_DEFAULT;
+            spammerWalletState.address = addr.result.address;
+            pushSpammerLog('info', 'Resumed already-open spammer wallet');
+            const accounts = await refreshLeafCache().catch(() => 0);
+            if (accounts > 0) {
+                spammerWalletState.tree_built = true;
+                spammerWalletState.tree_leaves = accounts;
+                spammerWalletState.num_outputs = accounts;
+            }
+            return;
+        }
+    } catch (_) { /* nothing open, try disk */ }
+    if (checkSpammerWalletFileExists()) {
+        spammerWalletState.wallet_file_exists = true;
+        try {
+            await openSpammerWallet(SPAMMER_WALLET_DEFAULT, '');
+            pushSpammerLog('info', 'Auto-opened spammer wallet from disk');
+            const accounts = await refreshLeafCache().catch(() => 0);
+            if (accounts > 0) {
+                spammerWalletState.tree_built = true;
+                spammerWalletState.tree_leaves = accounts;
+                spammerWalletState.num_outputs = accounts;
+            }
+        } catch (e) {
+            pushSpammerLog('warning', `Wallet file found but auto-open failed: ${e.message}`);
+        }
+    }
 }
 
 // ── Export for server.js integration ───────────────────────────────────────────
@@ -405,6 +504,8 @@ module.exports = {
     getSpammerSeed,
     getSpammerRestoreHeight,
     refreshSpammerWalletState,
+    refreshLeafCache,
+    initSpammerState,
     fundSpammerWallet,
     buildOutputTree,
     startSpamLoop,

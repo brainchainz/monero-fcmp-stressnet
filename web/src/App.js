@@ -1079,9 +1079,9 @@ function StressTestTab() {
             await axios.post(`${API}/xmrspammer/tree/build`, {
                 levels: parseInt(treeLevels),
                 outputsPerAccount: parseInt(treeOutputs),
-                fee: 0.0001
+                priority: 1
             }, { timeout: 30000 });
-            setTreeResult({ success: true, msg: 'Tree built successfully' });
+            setTreeResult({ success: true, msg: 'Build started — progress below (batches wait ~2 min between txs for change to unlock)' });
             fetchSpammer();
         } catch (e) {
             setTreeResult({ success: false, msg: e.response?.data?.error || e.message });
@@ -1204,10 +1204,15 @@ function StressTestTab() {
                 ) : (
                     <div className="stress-form">
                         <div className="form-row">
-                            <StatCard label="Balance" value={`${fmtBal(spammer.balance)} tXMR`} accent="var(--accent)" />
-                            <StatCard label="Unlocked" value={`${fmtBal(spammer.unlocked_balance)} tXMR`} accent="var(--green)" />
+                            <StatCard label="Total Balance" value={`${fmtBal(spammer.total_balance ?? spammer.balance)} tXMR`}
+                                sub="across all accounts" accent="var(--accent)" />
+                            <StatCard label="Unlocked" value={`${fmtBal(spammer.total_unlocked ?? spammer.unlocked_balance)} tXMR`} accent="var(--green)" />
                             <StatCard label="Accounts" value={spammer.num_accounts || 1} accent="var(--tor)" />
-                            <StatCard label="Outputs" value={spammer.num_outputs || 0} accent="var(--text-2)" />
+                            <StatCard label="Wallet Sync"
+                                value={spammer.blocks_behind === null || spammer.blocks_behind === undefined ? '—'
+                                    : spammer.blocks_behind <= 2 ? 'SYNCED'
+                                    : `${spammer.blocks_behind.toLocaleString()} behind`}
+                                accent={spammer.blocks_behind !== null && spammer.blocks_behind <= 2 ? 'var(--green)' : '#eab308'} />
                         </div>
                         <div className="form-group" style={{ marginTop: 8 }}>
                             <label>Spammer Address</label>
@@ -1264,6 +1269,7 @@ function StressTestTab() {
                     {fundResult && (
                         <div className={`tx-result ${fundResult.success ? 'tx-ok' : 'tx-fail'}`} style={{ marginTop: 8 }}>
                             {fundResult.msg}
+                            {fundResult.success && <span className="dimmed"> — funds unlock after 10 confirmations (~20 min)</span>}
                         </div>
                     )}
                 </div>
@@ -1288,19 +1294,27 @@ function StressTestTab() {
                                 onChange={e => setTreeLevels(Math.min(5, parseInt(e.target.value) || 1))} disabled={treeBuilding} min="1" max="5" />
                         </div>
                         <div className="form-group" style={{ display: 'flex', alignItems: 'flex-end' }}>
-                            <button className="btn-primary" onClick={handleBuildTree} disabled={treeBuilding || spammer?.spamming}>
-                                <Icons.BarChart size={14} /> {treeBuilding ? 'Building...' : 'Build Tree'}
+                            <button className="btn-primary" onClick={handleBuildTree}
+                                disabled={treeBuilding || spammer?.tree_building || spammer?.spamming}>
+                                <Icons.BarChart size={14} /> {(treeBuilding || spammer?.tree_building) ? 'Building...' : 'Build Tree'}
                             </button>
                         </div>
                     </div>
-                    {treeResult && (
+                    {spammer?.tree_building && spammer?.tree_progress && (
+                        <div className="info-bar" style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <span className="spinner" />
+                            {spammer.tree_progress.phase}: {spammer.tree_progress.done}/{spammer.tree_progress.total}
+                        </div>
+                    )}
+                    {treeResult && !spammer?.tree_building && (
                         <div className={`tx-result ${treeResult.success ? 'tx-ok' : 'tx-fail'}`} style={{ marginTop: 8 }}>
                             {treeResult.msg}
                         </div>
                     )}
-                    {spammer.tree_built && (
+                    {spammer.tree_built && !spammer.tree_building && (
                         <p className="mono-xs" style={{ color: 'var(--green)', marginTop: 8 }}>
-                            Tree built: {spammer.tree_leaves} funded leaves across {spammer.num_accounts} accounts
+                            Tree built: {spammer.tree_leaves} funded leaves across {spammer.num_accounts} accounts.
+                            Leaf outputs unlock after 10 confirmations (~20 min).
                         </p>
                     )}
                 </div>
@@ -1318,7 +1332,10 @@ function StressTestTab() {
                         </div>
                         <div className="form-group" style={{ display: 'flex', alignItems: 'flex-end' }}>
                             {!spammer?.spamming ? (
-                                <button className="btn-danger" onClick={handleStartSpam} disabled={spamStarting || treeBuilding}>
+                                <button className="btn-danger" onClick={handleStartSpam}
+                                    disabled={spamStarting || treeBuilding || spammer?.tree_building
+                                        || (spammer?.blocks_behind ?? 0) > 2
+                                        || (spammer?.num_accounts ?? 0) <= 1}>
                                     <Icons.Zap size={14} /> {spamStarting ? 'Starting...' : 'Start Spam'}
                                 </button>
                             ) : (
@@ -1328,6 +1345,16 @@ function StressTestTab() {
                             )}
                         </div>
                     </div>
+                    {!spammer?.spamming && (spammer?.blocks_behind ?? 0) > 2 && (
+                        <p className="mono-xs dimmed" style={{ marginTop: 6 }}>
+                            Waiting for the spammer wallet to finish syncing ({spammer.blocks_behind.toLocaleString()} blocks behind) — spam txs would fail until then.
+                        </p>
+                    )}
+                    {!spammer?.spamming && (spammer?.num_accounts ?? 0) <= 1 && (
+                        <p className="mono-xs dimmed" style={{ marginTop: 6 }}>
+                            Build the output tree first — the spam loop sweeps leaf accounts round-robin.
+                        </p>
+                    )}
                     {spamResult && (
                         <div className={`tx-result ${spamResult.success ? 'tx-ok' : 'tx-fail'}`} style={{ marginTop: 8 }}>
                             {spamResult.msg}

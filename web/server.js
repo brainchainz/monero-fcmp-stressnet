@@ -2090,10 +2090,12 @@ app.post('/api/xmrspammer/wallet/fund', async (req, res) => {
 });
 app.post('/api/xmrspammer/tree/build', async (req, res) => {
     try {
-        const { levels = 2, outputsPerAccount = 4, fee = 0.0001 } = req.body;
+        const { levels = 2, outputsPerAccount = 4, priority = 1 } = req.body;
         res.json({ status: 'building', message: 'Starting output tree build...' });
-        // Build in background
-        spammer.buildOutputTree(outputsPerAccount, levels, fee).then(result => {
+        // Build in background; progress is exposed via wallet/status
+        // (tree_building + tree_progress). Note: third arg is a fee PRIORITY
+        // (0-4), not an amount — the old code passed 0.0001 here.
+        spammer.buildOutputTree(outputsPerAccount, levels, priority).then(result => {
             spammer.spammerWalletState.log.unshift({ time: new Date().toISOString(), level: 'info', message: `Output tree build complete: ${JSON.stringify(result)}` });
         }).catch(err => {
             spammer.spammerWalletState.log.unshift({ time: new Date().toISOString(), level: 'error', message: `Output tree build failed: ${err.message}` });
@@ -2124,7 +2126,9 @@ app.get('/api/xmrspammer/spam/status', (req, res) => {
     });
 });
 app.get('/api/xmrspammer/log', (req, res) => {
-    res.json({ logs: spammer.spammerWalletState.logs || [] });
+    // Field is `log` (singular); the old `.logs` read meant this endpoint
+    // returned an empty list forever and the UI's spammer log never rendered.
+    res.json({ logs: spammer.spammerWalletState.log || [] });
 });
 app.get('/api/xmrspammer/wallet/seed', async (req, res) => {
     try {
@@ -2429,6 +2433,9 @@ app.listen(port, '0.0.0.0', () => {
     initMonitorDb();
     // Delay collector start to give monerod time to initialize
     setTimeout(startMonitorCollector, 10000);
+    // Resume/auto-open the spammer wallet (delayed for spammer-wallet-rpc boot)
+    setTimeout(() => spammer.initSpammerState().catch(e =>
+        console.log('[spammer] init probe failed:', e.message)), 15000);
     // Auto-open wallet on startup (wallet-rpc may not be ready yet, retry)
     async function autoOpenWallet(retries = 20, delayMs = 2000) {
         await ensureWalletRingDb();
