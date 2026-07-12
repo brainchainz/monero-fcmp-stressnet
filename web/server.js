@@ -22,6 +22,9 @@ const MONEROD_CONTAINER_NAME = process.env.MONEROD_CONTAINER_NAME || 'brainchain
 const WALLET_REFRESH_MS = Number(process.env.WALLET_REFRESH_MS) || 60000;
 const WALLET_RPC_FAST_TIMEOUT_MS = Number(process.env.WALLET_RPC_FAST_TIMEOUT_MS) || 90000;
 const WALLET_RPC_SLOW_TIMEOUT_MS = Number(process.env.WALLET_RPC_SLOW_TIMEOUT_MS) || 300000;
+// A full rescan_blockchain re-scans from the wallet's restore height and can
+// take many minutes; give it a long ceiling so the job isn't killed mid-scan.
+const WALLET_RPC_RESCAN_TIMEOUT_MS = Number(process.env.WALLET_RPC_RESCAN_TIMEOUT_MS) || 1800000;
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 app.use(cors());
 app.use(bodyParser.json());
@@ -1333,15 +1336,28 @@ app.post('/api/wallet/close', async (req, res) => {
     }
 });
 app.post('/api/wallet/rescan', async (req, res) => {
-    try {
-        pushLog('info', 'wallet', 'Starting blockchain rescan...');
-        const result = await callWalletRpc('rescan_blockchain');
-        pushLog('info', 'wallet', 'Blockchain rescan complete');
-        res.json(result);
-    } catch (error) {
-        pushLog('error', 'wallet', `Rescan failed: ${error.message}`);
-        res.status(500).json({ error: 'Failed to rescan blockchain', details: error.message });
+    if (!walletState.wallet_open) {
+        return res.status(400).json({ error: 'No wallet open' });
     }
+    // mode=spent (fast): re-checks which owned outputs are spent, fixing a
+    // stuck/incorrect balance without re-reading the chain.
+    // mode=blockchain (slow): re-scans the whole chain from the restore height,
+    // rebuilding transaction history. Run as a background job (the old handler
+    // blocked synchronously and timed out on any real rescan); the UI reflects
+    // progress via wallet/status (busy) and can poll jobs/:id.
+    const mode = req.body?.mode === 'blockchain' ? 'blockchain' : 'spent';
+    const method = mode === 'blockchain' ? 'rescan_blockchain' : 'rescan_spent';
+    const label = mode === 'blockchain'
+        ? 'Rescanning blockchain (this can take several minutes)'
+        : 'Rescanning spent outputs';
+    const job = createWalletJob('rescan', label, async () => {
+        pushLog('info', 'wallet', `Starting ${method}...`);
+        const result = await callWalletRpc(method, {}, WALLET_RPC_RESCAN_TIMEOUT_MS);
+        await refreshWalletState({ force: true }).catch(() => null);
+        pushLog('info', 'wallet', `${method} complete`);
+        return result;
+    });
+    res.json({ status: 'started', mode, job: { id: job.id, label }, wallet: publicWalletState() });
 });
 app.get('/api/wallet/seed', async (req, res) => {
     try {
