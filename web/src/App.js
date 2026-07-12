@@ -839,22 +839,28 @@ function MonitorTab() {
     const [poolData, setPoolData] = useState([]);
     const [blockData, setBlockData] = useState([]);
     const [connData, setConnData] = useState([]);
+    const [syncData, setSyncData] = useState(null);
+    const [banData, setBanData] = useState([]);
     const [summary, setSummary] = useState(null);
     const [loading, setLoading] = useState(true);
 
     const fetchData = useCallback(async () => {
         try {
-            const [info, pool, blocks, conns, sum] = await Promise.all([
+            const [info, pool, blocks, conns, sync, bans, sum] = await Promise.all([
                 axios.get(`${API}/monitor/info?window=${window}`).catch(() => ({ data: [] })),
                 axios.get(`${API}/monitor/pool?window=${window}`).catch(() => ({ data: [] })),
                 axios.get(`${API}/monitor/blocks?window=${window}`).catch(() => ({ data: [] })),
                 axios.get(`${API}/monitor/connections?window=${window}`).catch(() => ({ data: [] })),
+                axios.get(`${API}/monitor/sync?window=${window}`).catch(() => ({ data: null })),
+                axios.get(`${API}/monitor/bans?window=${window}`).catch(() => ({ data: [] })),
                 axios.get(`${API}/monitor/summary`).catch(() => ({ data: null })),
             ]);
             setInfoData(info.data);
             setPoolData(pool.data);
             setBlockData(blocks.data);
             setConnData(conns.data);
+            setSyncData(sync.data);
+            setBanData(bans.data);
             setSummary(sum.data);
         } catch {} finally {
             setLoading(false);
@@ -907,8 +913,61 @@ function MonitorTab() {
                         </div>
                     )}
 
+                    {/* Sync health over Tor: the metrics that decide whether a
+                        Tor-only node converges. blocks_behind is judged against
+                        the highest tip ever observed, so peer gaps (where monerod
+                        reports target_height=0) don't show a false 100%. */}
+                    {syncData?.summary && (
+                        <>
+                            <div className="chart-section-title">Sync Health (Tor)</div>
+                            <div className="stats-row" style={{ marginBottom: 16 }}>
+                                <StatCard label="Blocks Behind"
+                                    value={syncData.summary.blocks_behind.toLocaleString()}
+                                    accent={syncData.summary.blocks_behind <= 2 ? '#22c55e' : 'var(--accent)'} />
+                                <StatCard label="Sync Rate"
+                                    value={`${syncData.summary.sync_rate_blk_min} blk/min`}
+                                    sub={`tip grows ${syncData.summary.tip_rate_blk_min} blk/min`} />
+                                <StatCard label="Peer Uptime"
+                                    value={`${syncData.summary.peer_uptime_pct}%`}
+                                    accent={syncData.summary.peer_uptime_pct >= 80 ? '#22c55e' : syncData.summary.peer_uptime_pct >= 40 ? '#eab308' : '#ef4444'}
+                                    sub="samples with a peer" />
+                                <StatCard label="Catch-up ETA"
+                                    value={syncData.summary.blocks_behind <= 2 ? 'synced'
+                                        : syncData.summary.eta_days === null ? 'not converging'
+                                        : syncData.summary.eta_days < 1 ? '<1 day'
+                                        : `~${syncData.summary.eta_days} days`}
+                                    accent={syncData.summary.eta_days === null ? '#ef4444' : 'var(--tor)'} />
+                            </div>
+                            <div className="chart-grid">
+                                <MiniChart data={syncData.series} dataKey="blocks_behind" label="Blocks Behind"
+                                    color="var(--accent)" />
+                                <MiniChart data={syncData.series} dataKey="out_peers" label="Outgoing Peers"
+                                    color="#22c55e" />
+                                <MiniChart data={syncData.series} dataKey="height" label="Node Height"
+                                    color="var(--tor)" />
+                                {banData.length >= 2
+                                    ? <MiniChart data={banData} dataKey="ban_count" label="Peer Bans" color="#ef4444" />
+                                    : <div className="mini-chart glass-panel">
+                                        <div className="mini-chart-header">
+                                            <span className="mini-chart-label">Peer Bans</span>
+                                            <span className="mini-chart-value" style={{ color: '#22c55e' }}>none</span>
+                                        </div>
+                                        <div className="mini-chart-empty" style={{ width: 320, height: 120 }}>
+                                            <span className="mono-xs dimmed">No peer bans in this window</span>
+                                        </div>
+                                    </div>}
+                            </div>
+                        </>
+                    )}
+
                     {/* Chart grid — txpool & blocks */}
-                    <div className="chart-section-title">Transaction Pool &amp; Blocks</div>
+                    <div className="chart-section-title">Transaction Pool &amp; Blocks
+                        {syncData?.summary?.blocks_behind > 10 && (
+                            <span className="mono-xs dimmed" style={{ marginLeft: 8, textTransform: 'none' }}>
+                                mempool stays empty until the node reaches the chain tip
+                            </span>
+                        )}
+                    </div>
                     <div className="chart-grid">
                         <MiniChart data={poolData} dataKey="bytes_total" label="TX Pool Bytes"
                             color="var(--accent)" yFormat={fmt.bytes} />

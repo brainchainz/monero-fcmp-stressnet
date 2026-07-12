@@ -1587,11 +1587,15 @@ async function collectMonitorData() {
                 );
             }
         } catch {}
-        // 3. get_last_block_header
+        // 3. Top block header. get_last_block_header returns all-zero fields on
+        // this FCMP++ build, so ask for the top block by height instead
+        // (verified working: real weight/reward/num_txes).
         try {
-            const blockRes = await callNodeRpc('get_last_block_header');
+            const blockRes = info?.height > 0
+                ? await callNodeRpc('get_block_header_by_height', { height: info.height - 1 })
+                : await callNodeRpc('get_last_block_header');
             const bh = blockRes.result?.block_header;
-            if (bh) {
+            if (bh && bh.height > 0) {
                 insertBlockHeader().run(
                     now, bh.block_size, bh.block_weight, bh.cumulative_difficulty,
                     bh.depth, bh.difficulty, bh.hash, bh.height, bh.major_version,
@@ -1638,9 +1642,27 @@ async function collectMonitorData() {
         pushLog('error', 'monitor', `Collection failed: ${err.message}`);
     }
 }
+// Retention: the collector writes ~2,900 info rows and up to ~8,600 connection
+// rows per day, forever. Keep 30 days; older points only ever feed the "all"
+// window, which is downsampled anyway.
+const MONITOR_RETENTION_DAYS = 30;
+function pruneMonitorData() {
+    try {
+        const cutoff = new Date(Date.now() - MONITOR_RETENTION_DAYS * 86400000).toISOString();
+        let pruned = 0;
+        for (const table of ['info', 'pool_stats', 'last_block_header', 'fee_estimate', 'connections', 'bans']) {
+            pruned += db.prepare(`DELETE FROM ${table} WHERE time < ?`).run(cutoff).changes;
+        }
+        if (pruned > 0) pushLog('info', 'monitor', `Pruned ${pruned} data points older than ${MONITOR_RETENTION_DAYS} days`);
+    } catch (e) {
+        pushLog('error', 'monitor', `Prune failed: ${e.message}`);
+    }
+}
 // Collect every 30 seconds (matching Rucknium's interval)
 let monitorInterval;
 function startMonitorCollector() {
+    pruneMonitorData();
+    setInterval(pruneMonitorData, 6 * 3600000);
     collectMonitorData();
     monitorInterval = setInterval(collectMonitorData, 30000);
     pushLog('info', 'monitor', 'Data collector started (30s interval)');
@@ -1657,55 +1679,71 @@ function getTimeFilter(window) {
         default:     return '1970-01-01T00:00:00.000Z'; // all
     }
 }
+// Bucket size for downsampling. The collector writes a row every 30s, so the
+// week window is ~20k raw rows and "all" is unbounded; the charts only render
+// a few hundred points usefully. hour/day stay raw.
+function getBucketSeconds(window) {
+    switch (window) {
+        case 'week': return 600;   // ~1000 points
+        case 'all':  return 1800;
+        default:     return 0;     // raw
+    }
+}
+// Build a SELECT for a time-series table: raw rows for small windows, averaged
+// buckets (grouped on unix-time / bucket) for wide ones. Column order is
+// preserved so the response shape is identical either way.
+function timeSeriesQuery(table, columns, window) {
+    const since = getTimeFilter(window);
+    const bucket = getBucketSeconds(window);
+    if (!bucket) {
+        return db.prepare(`
+            SELECT time, ${columns.join(', ')}
+            FROM ${table} WHERE time > ? ORDER BY time ASC
+        `).all(since);
+    }
+    const aggregated = columns.map(c => `AVG(${c}) as ${c}`).join(', ');
+    return db.prepare(`
+        SELECT MAX(time) as time, ${aggregated}
+        FROM ${table} WHERE time > ?
+        GROUP BY CAST(strftime('%s', time) AS INTEGER) / ${bucket}
+        ORDER BY time ASC
+    `).all(since);
+}
 // Generic time-series query
 app.get('/api/monitor/info', (req, res) => {
     try {
-        const since = getTimeFilter(req.query.window);
-        const rows = db.prepare(`
-            SELECT time, height, difficulty, database_size, tx_count, tx_pool_size,
-                   incoming_connections_count, outgoing_connections_count,
-                   block_weight_median, rpc_response_ms, free_space,
-                   white_peerlist_size, grey_peerlist_size, synchronized
-            FROM info WHERE time > ? ORDER BY time ASC
-        `).all(since);
-        res.json(rows);
+        res.json(timeSeriesQuery('info', [
+            'height', 'difficulty', 'database_size', 'tx_count', 'tx_pool_size',
+            'incoming_connections_count', 'outgoing_connections_count',
+            'block_weight_median', 'rpc_response_ms', 'free_space',
+            'white_peerlist_size', 'grey_peerlist_size', 'synchronized'
+        ], req.query.window));
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 app.get('/api/monitor/pool', (req, res) => {
     try {
-        const since = getTimeFilter(req.query.window);
-        const rows = db.prepare(`
-            SELECT time, bytes_total, txs_total, fee_total, bytes_mean, oldest,
-                   num_double_spends, num_failing, num_not_relayed
-            FROM pool_stats WHERE time > ? ORDER BY time ASC
-        `).all(since);
-        res.json(rows);
+        res.json(timeSeriesQuery('pool_stats', [
+            'bytes_total', 'txs_total', 'fee_total', 'bytes_mean', 'oldest',
+            'num_double_spends', 'num_failing', 'num_not_relayed'
+        ], req.query.window));
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 app.get('/api/monitor/blocks', (req, res) => {
     try {
-        const since = getTimeFilter(req.query.window);
-        const rows = db.prepare(`
-            SELECT time, block_weight, difficulty, height, num_txes, reward, timestamp
-            FROM last_block_header WHERE time > ? ORDER BY time ASC
-        `).all(since);
-        res.json(rows);
+        res.json(timeSeriesQuery('last_block_header', [
+            'block_weight', 'difficulty', 'height', 'num_txes', 'reward', 'timestamp'
+        ], req.query.window));
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 app.get('/api/monitor/fees', (req, res) => {
     try {
-        const since = getTimeFilter(req.query.window);
-        const rows = db.prepare(`
-            SELECT time, fee, quantization_mask
-            FROM fee_estimate WHERE time > ? ORDER BY time ASC
-        `).all(since);
-        res.json(rows);
+        res.json(timeSeriesQuery('fee_estimate', ['fee', 'quantization_mask'], req.query.window));
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -1739,6 +1777,57 @@ app.get('/api/monitor/bans', (req, res) => {
             GROUP BY time ORDER BY time ASC
         `).all(since);
         res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+// Sync health over Tor. monerod reports target_height=0 (and synchronized=1)
+// whenever it has no peers, so "blocks behind" must be judged against the
+// highest tip ever observed, and peer-uptime is the % of samples that held at
+// least one outgoing connection. These are THE health signals for a Tor-only
+// node: sync speed comes down to how often it holds a peer.
+app.get('/api/monitor/sync', (req, res) => {
+    try {
+        const since = getTimeFilter(req.query.window);
+        const rows = db.prepare(`
+            SELECT time, height, target_height, outgoing_connections_count
+            FROM info WHERE time > ? AND height > 0 ORDER BY time ASC
+        `).all(since);
+        // Seed the running tip with the highest target seen BEFORE the window,
+        // so a short window during a peer gap doesn't report a false tip.
+        const seed = db.prepare(`
+            SELECT MAX(MAX(target_height), MAX(height)) as tip FROM info WHERE time <= ?
+        `).get(since);
+        let tip = seed?.tip || 0;
+        const series = rows.map(r => {
+            tip = Math.max(tip, r.target_height || 0, r.height);
+            return {
+                time: r.time,
+                height: r.height,
+                blocks_behind: Math.max(0, tip - r.height),
+                out_peers: r.outgoing_connections_count || 0
+            };
+        });
+        let summary = null;
+        if (series.length >= 2) {
+            const first = series[0], last = series[series.length - 1];
+            const mins = (new Date(last.time) - new Date(first.time)) / 60000;
+            const rate = mins > 0 ? (last.height - first.height) / mins : 0;
+            const tipRate = mins > 0 ? Math.max(0, (last.blocks_behind + last.height)
+                - (first.blocks_behind + first.height)) / mins : 0;
+            const net = rate - tipRate;
+            summary = {
+                blocks_behind: last.blocks_behind,
+                network_tip: tip,
+                sync_rate_blk_min: Math.round(rate * 100) / 100,
+                tip_rate_blk_min: Math.round(tipRate * 100) / 100,
+                peer_uptime_pct: Math.round(100 * series.filter(s => s.out_peers > 0).length / series.length),
+                // days until caught up at the current net rate; null = not converging
+                eta_days: last.blocks_behind <= 2 ? 0
+                    : (net > 0.01 ? Math.round(last.blocks_behind / net / 144) / 10 : null)
+            };
+        }
+        res.json({ series, summary });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
